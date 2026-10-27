@@ -153,10 +153,12 @@ background-only client (a batch extractor, say) gets one id that always yields, 
 A server started with `--adapter NAME=FOLDER` (DeepSeek-V4.1 on CUDA, [adapters.md](adapters.md)) lists each adapter in
 `/v1/models` as a model id of its own, with `parent` and `root` naming the base model. A request picks an adapter by
 that `model` id, or by the `adapter` field (the adapter's name) beside any model id; replies name the model id asked
-for. A request naming no adapter runs the base model, bit for bit as without the flag. An `adapter` that is not held
-or that contradicts the `model` id is a 400 before any stream opens, never the base model's answer. A server started
-without `--adapter` ignores the field like any other unknown one. The Responses route forwards `adapter`; the Anthropic
-Messages route picks an adapter by its `model` id only.
+for. A request naming no adapter runs the base model: the adapter kernels never read or write its rows, so by
+construction no adapter changes its output. To confirm on your hardware that it matches a server started without the
+flag, compare the two servers' token hashes ([adapters.md](adapters.md#checking-a-running-server)). An `adapter` that
+is not held or that contradicts the `model` id is a 400 before any stream opens, never the base model's answer. A
+server started without `--adapter` ignores the field like any other unknown one. The Responses route forwards
+`adapter`; the Anthropic Messages route picks an adapter by its `model` id only.
 
 ## Messages and tools
 

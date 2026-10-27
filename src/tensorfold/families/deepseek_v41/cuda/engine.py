@@ -50,6 +50,15 @@ def _drop_pages(fds: list) -> None:
         _drop_busy.release()
 
 
+def _same_on_every_rank(flags: list[list[int]]) -> None:
+    """Refuse a start whose ranks gathered different words (each rank's row of them)."""
+
+    if any(f != flags[0] for f in flags):
+        raise ValueError("--vision, --parallel, TF_DS_MARKOV, TF_DS_MARKOV_SPLIT and the --adapter files, names, "
+                         "strengths and order must be the same on every rank (rank 0 and the workers run the same "
+                         f"steps): {flags}")
+
+
 # drafts verified a round chosen from the confidence head's prefix survival and measured window costs (0: fixed k)
 ADAPTIVE = os.environ.get("TF_DS_ADAPTIVE", "0") == "1"
 # before serving: caches at full size, the Triton kernels prompt chunks use, every decode graph (each window size at each
@@ -168,11 +177,7 @@ class DsEngine:
                                 dtype=torch.int64, device="cuda")
             every = torch.empty((world * 8,), dtype=torch.int64, device="cuda")
             nccl.all_gather(mine, every)
-            flags = every.view(world, 8).tolist()
-            if any(f != flags[0] for f in flags):
-                raise ValueError("--vision, --parallel, TF_DS_MARKOV, TF_DS_MARKOV_SPLIT and the --adapter files, "
-                                 "names and strengths must be the same on every rank (rank 0 and the workers run "
-                                 f"the same steps): {flags}")
+            _same_on_every_rank(every.view(world, 8).tolist())
         if WARM:
             self.warm()
         if self.concurrent:

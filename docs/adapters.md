@@ -70,18 +70,23 @@ rebuilt at run time. The delta of a packed shared expert is therefore computed f
 store (relative error at most 2^-11 per element); a shared expert outside the pack reads its bf16 hidden state as is.
 
 On start every rank gathers a digest of the base config and each adapter's slot, name and identity key, and refuses to
-serve if they differ. Each admission carries `[slot, key]` to the followers, and every step's agreement check includes
-the slots of the live streams, so a rank that disagrees fails the step on every rank before any collective.
+serve if they differ. Slots follow the order of the `--adapter` flags, so every rank needs the same flags in the same
+order: two adapters swapped is refused too. Each admission carries `[slot, key]` to the followers, and every step's
+agreement check includes the slots of the live streams, so a rank that disagrees fails the step on every rank before any
+collective.
 
 ## Graphs and rows
 
 Slot 0 is the base model. A round's inputs carry one adapter slot a row (a sixth row of the graph's input buffer, read at
 replay), padded rows copy their original's slot, and prompt chunks run one slot for all their rows. Two Triton kernels
 add `scale * B @ (A @ x)` for a row's slot: one program per row and tile, fp32 sums in a fixed order, one tile shape for
-every table. A row's bits depend on its own input and its adapter's factors only: not on the other rows, their
-adapters, the padding, the chunk it was prefilled in, or the largest rank of any other adapter. A row of slot 0 is
-neither read nor written, so a base-model row keeps its bits. A layer no adapter edits runs nothing. The kernels are built
-at start, before the graph warm-up.
+every table. By construction a row's delta depends on its own input and its adapter's factors only: not on the other
+rows, their adapters, the padding, the chunk it was prefilled in, or the largest rank of any other adapter. A row of
+slot 0 is neither read nor written. The CPU tests check a row alone, reordered and padded against the whole batch, and
+stock rows left untouched, under Triton's interpreter. The same on the compiled kernels, in prompt chunks, in captured
+graphs and beside a larger rank is what the GPU tests (`tests/cuda/test_deepseek_v41_adapter_kernels.py`) and, on a
+running server, `tools/dsv41/adapter_mix.py` check; they need a GPU. A layer no adapter edits runs nothing. The kernels
+are built at start, before the graph warm-up.
 
 ## Caches
 
