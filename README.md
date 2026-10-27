@@ -122,6 +122,7 @@ between MLX and CUDA, different quantizations, or different tensor-parallel rank
 | `--vision-max-images N` | With `--vision`, images across the full request history (default 4); other image limits still apply | Both |
 | `--vision-image-tokens N` | With `--vision`, the visual tokens a request's images share (default 4,096, up to 65,536); each image keeps at most 4,096 | CUDA Qwen |
 | `--alias` | Additional model IDs | Both |
+| `--adapter NAME=FOLDER`, `--adapter-strength NAME=X` | Serve a LoRA adapter as model ID NAME beside the base model, from the same weights ([docs/adapters.md](docs/adapters.md)) | DeepSeek-V4.1 CUDA with `--parallel >=2` |
 | `--context N` | Prompt plus reply capacity | Both |
 | `--max-tokens N` | Default reply limit, 4096 | Both |
 | `--temperature`, `--top-p`, `--top-k`, `--min-p` | Sampling defaults; temperature zero is greedy | Both |
