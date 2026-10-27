@@ -49,6 +49,14 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                           help="with --vision on CUDA Qwen checkpoints, the visual tokens a request's images share "
                                "(default: 4096, at most 65536); each image keeps at most 4096")
 
+    adapters = serve.add_argument_group("adapters (DeepSeek-V4.1 on CUDA; docs/adapters.md)")
+    adapters.add_argument("--adapter", action="append", default=[], metavar="NAME=FOLDER",
+                          help="serve the LoRA adapter in FOLDER (PEFT files, wo_b and the shared expert's w2) as model "
+                               "id NAME beside the base model, both from one set of weights; repeatable; needs --parallel 2 "
+                               "or more")
+    adapters.add_argument("--adapter-strength", action="append", default=[], metavar="NAME=NUMBER",
+                          help="multiply adapter NAME's scale (default 1; a negative number inverts its edit)")
+
     generation = serve.add_argument_group("generation (requests can override each of these)")
     generation.add_argument("--context", type=int, default=None,
                             help="prompt plus reply window (default: model config; CUDA default/0: "

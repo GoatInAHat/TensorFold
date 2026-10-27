@@ -59,6 +59,7 @@ class PreparedRequest:
     vision: Any = None
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
+    adapter: str | None = None   # the adapter the request selects (its name), or None for the stock model
 
 
 def _native_context(model_dir: Path) -> int:
@@ -94,6 +95,7 @@ class App:
         self.served = served
         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
         self.background_ids = frozenset(background_ids)   # --name-priority ID=background: a default for this id
+        self.adapter_models: dict[str, str] = {}      # model id -> adapter name, for engines that serve adapters
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
@@ -124,10 +126,23 @@ class App:
         """The ids this endpoint answers to, as the MLX server lists them: ``--name`` first, then each ``--alias``."""
 
         ids: list[str] = []
-        for model_id in (self.served, *getattr(self, "aliases", ())):
+        for model_id in (self.served, *getattr(self, "aliases", ()), *getattr(self, "adapter_models", {})):
             if model_id and model_id not in ids:
                 ids.append(model_id)
         return ids
+
+    def adapter_for(self, body: Any) -> str | None:
+        """The adapter a request selects: its model id when that is an adapter's, else its "adapter" field; None is the
+        stock model. Where the engine serves adapters, an unknown or contradictory choice is refused, never answered
+        by the stock model."""
+
+        registry = getattr(self.engine, "adapters", None)
+        if registry is None or not isinstance(body, dict):
+            return None
+        try:
+            return registry.pick(body, getattr(self, "adapter_models", None) or {})
+        except LookupError as exc:
+            raise RequestError(str(exc)) from exc
 
     def reply_model(self, body: Any) -> str:
         """The id a reply names: the one the request asked for when this endpoint answers to it, else ``--name``."""
@@ -148,6 +163,10 @@ class App:
             return "this model's CUDA engine has no serial switch (\"draft\": false)"
         if not isinstance(body.get("messages", []), list):
             return "messages must be a list"
+        try:
+            self.adapter_for(body)
+        except RequestError as exc:
+            return str(exc)
         problem = grammar.refusal(body)                 # a malformed grammar field, or one beside a required call
         if problem is None and grammar.request_spec(body) and "constraint" not in inspect.signature(
                 self.engine.generate).parameters:
@@ -423,6 +442,7 @@ class App:
         if problem:
             raise refusal(problem)
         prepared = self._prepare(body, chat)
+        prepared.adapter = self.adapter_for(body)
         problem = self.check(body, prepared=prepared)
         if problem:
             raise refusal(problem)
@@ -548,6 +568,10 @@ class App:
             options["probabilities"] = probabilities
         if takes_stop_eos:
             options["stop_eos"] = not prepared.ignore_eos
+        if prepared.adapter is not None:
+            if "adapter" not in inspect.signature(self.engine.generate).parameters:
+                raise RequestError("this model's engine does not serve adapters")
+            options["adapter"] = prepared.adapter
         shaped = prepared.grammar is not None or prepared.think_budget > 0
         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
         budget = self._think_budget(prepared, think_end)

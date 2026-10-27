@@ -31,6 +31,7 @@ class Stream:
     drafts: list[int] = field(default_factory=list)       # an MTP family's drafts for the next round
     stops: list[int] = field(default_factory=list)        # prompt positions whose states the prefill keeps
     constraint: Any = None                                # the reply's grammar (tensorfold.engine.grammar), or None
+    adapter: Any = None                                   # the adapter the reply runs (an engine's reference), or None
     background: bool = False                              # priority "background": after, and yielding to, the rest
     probabilities: Any = None
     carry: dict | None = None                             # the stats of the stream this one continues
@@ -84,7 +85,7 @@ class Stream:
         """This stream again from its prompt, for later (as the Mac replays): what it sent is owed, not sent again."""
 
         return Stream(self.prompt, self.count, self.sampling, draft=self.draft, stop_eos=self.stop_eos, emit=self.emit,
-                      background=self.background, probabilities=self.probabilities,
+                      background=self.background, probabilities=self.probabilities, adapter=self.adapter,
                       carry=self.stats(), owed=[*self.out, *self.owed])
 
 

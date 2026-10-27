@@ -76,12 +76,14 @@ class Scheduler:
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
-               constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
-        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
+               constraint: Any = None, background: bool = False, probabilities: Any = None,
+               adapter: Any = None) -> dict:
+        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats.
+        ``adapter``: the engine's reference to the adapter it runs under (None: the stock model)."""
 
         box: queue.Queue = queue.Queue()
         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
-                        constraint=constraint, background=background, probabilities=probabilities)
+                        constraint=constraint, background=background, probabilities=probabilities, adapter=adapter)
         cancel = [False]
         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
         self.waiting.put((stream, box))

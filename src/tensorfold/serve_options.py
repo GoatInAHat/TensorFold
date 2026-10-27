@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import math
+import re
 from pathlib import Path
 from typing import Any
+
+_ADAPTER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}")
 
 
 def _served_name(args: argparse.Namespace) -> str:
@@ -31,8 +35,50 @@ def name_priority(args: argparse.Namespace) -> dict[str, str]:
     return parsed
 
 
+def adapter_specs(args: argparse.Namespace) -> list[tuple[str, str, float]]:
+    """``--adapter NAME=FOLDER`` and ``--adapter-strength NAME=NUMBER`` as (name, folder, strength) in the order
+    given (strength 1 unless named). No I/O: the folders are read when the engine starts."""
+
+    folders: dict[str, str] = {}
+    for entry in getattr(args, "adapter", None) or []:
+        name, sep, folder = str(entry).partition("=")
+        name, folder = name.strip(), folder.strip()
+        if not sep or not name or not folder:
+            raise ValueError(f"--adapter takes NAME=FOLDER, not {entry!r}")
+        if not _ADAPTER_NAME.fullmatch(name):
+            raise ValueError(f"--adapter name {name!r}: letters, digits and . _ : / - only, 1 to 96 characters")
+        if name in folders:
+            raise ValueError(f"--adapter {name} is given twice")
+        folders[name] = folder
+    strengths: dict[str, float] = {}
+    for entry in getattr(args, "adapter_strength", None) or []:
+        name, sep, value = str(entry).partition("=")
+        try:
+            number = float(value)
+        except ValueError:
+            number = math.nan
+        if not sep or not math.isfinite(number) or number == 0.0:
+            raise ValueError(f"--adapter-strength takes NAME=NUMBER (finite, not 0), not {entry!r}")
+        if name.strip() not in folders:
+            raise ValueError(f"--adapter-strength names {name.strip()!r}, which no --adapter defines")
+        strengths[name.strip()] = number
+    return [(name, folder, strengths.get(name, 1.0)) for name, folder in folders.items()]
+
+
 def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any = None) -> None:
     """Refuse KV cache, draft rule, image, share, slot and precision options the backend or family can't serve."""
+
+    adapters = adapter_specs(args)
+    if adapters:
+        if backend != "cuda" or not getattr(family.package, "CUDA_ADAPTERS", False):
+            raise ValueError(f"--adapter serves LoRA adapters from the DeepSeek-V4.1 CUDA engine; {family.title} on "
+                             f"{'CUDA' if backend == 'cuda' else 'MLX'} has none")
+        if _cuda_streams(getattr(args, "parallel", "auto")) < 2:
+            raise ValueError("--adapter needs --parallel 2 or more: each round's rows carry their own adapter")
+        taken = {_served_name(args), *(str(a).strip() for a in getattr(args, "alias", None) or () if str(a).strip())}
+        clash = sorted(name for name, _, _ in adapters if name in taken)
+        if clash:
+            raise ValueError(f"--adapter {', '.join(clash)} is already a model id of this server (--name or --alias)")
 
     if getattr(args, "vision_urls", False) and not getattr(args, "vision", False):
         raise ValueError("--vision-urls needs --vision")

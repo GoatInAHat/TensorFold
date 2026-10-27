@@ -16,7 +16,8 @@ from tensorfold import __version__
 from tensorfold import cli_args
 from tensorfold.server import stacks, thinking_notes
 from tensorfold.server.memory_budget import MEMORY_FRACTION
-from tensorfold.serve_options import check as _check_serve_options, name_priority as _name_priority
+from tensorfold.serve_options import adapter_specs as _adapter_specs, check as _check_serve_options
+from tensorfold.serve_options import name_priority as _name_priority
 from tensorfold.serve_options import vision_options as _vision_options
 
 COMMANDS = ("serve", "pull", "models", "info", "update", "service", "tui", "plan")
@@ -270,6 +271,9 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
         options["checkpoint_slots"] = int(args.checkpoint_slots)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
+    adapters = _adapter_specs(args)
+    if adapters:
+        options["adapters"], options["adapter_reserved"] = adapters, [served, *args.alias]
     where = f", rank {args.rank} of 2" if args.tp == 2 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
     from tensorfold.cuda import precision, prompt_precision
