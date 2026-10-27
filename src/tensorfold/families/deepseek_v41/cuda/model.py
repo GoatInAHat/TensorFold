@@ -414,8 +414,10 @@ def wo_a_rot(lay, n: int, device, head_dim: int) -> tuple:
     return suh, ga.buffers(n, device), lay.wo_a[0].k // head_dim
 
 
-def wo_ab(lay, o: torch.Tensor | None = None, xh: list | None = None, fold: bool = True) -> torch.Tensor:
-    """Apply wo_a then wo_b with FP32 output; a dense wo_b skips the EXL3 input rotation."""
+def wo_ab(lay, o: torch.Tensor | None = None, xh: list | None = None, fold: bool = True,
+          adapter=None) -> torch.Tensor:
+    """Apply wo_a then wo_b with FP32 output; a dense wo_b skips the EXL3 input rotation. ``adapter`` (lora_runtime.
+    RowAdapters): the rows' wo_b adapter deltas are added to the partial sum."""
 
     ga = _group(lay, "_tf_wo_a", lay.wo_a)
     dense = hasattr(lay.wo_b, "weight")
@@ -436,8 +438,10 @@ def wo_ab(lay, o: torch.Tensor | None = None, xh: list | None = None, fold: bool
         c += wo.n
     ga.rotated(xh, outs, rot=rot if fold else None)
     if not fold:                                      # wo_b's input rotated by its own rot_many launch
-        return mm(lay.wo_b, u, F32)
-    return gb.rotated(xb, out_dtypes=[F32])[0]
+        out = mm(lay.wo_b, u, F32)
+    else:
+        out = gb.rotated(xb, out_dtypes=[F32])[0]
+    return out if adapter is None else adapter.wo_b(lay, u, out)
 
 
 @dataclass
@@ -741,6 +745,7 @@ class Model:
         c = self.cfg
         self.Hl = c.n_heads // w.world
         self.scratch: dict = {}
+        self.lora = None                       # lora_runtime.LoraRuntime, when the engine serves adapters
         self.rope = RopeTables(c)
         self._zero = torch.zeros((1,), dtype=torch.int64, device="cuda")
         if not KERNELS and KV_QUANT:
@@ -1009,9 +1014,10 @@ class Model:
             store_rows(sc.comp[lay.idx], groups, lat, 16, True)
 
     def attention_k(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict, pos: torch.Tensor,
-                    floor: int = 0, kv_done: bool = False):
+                    floor: int = 0, kv_done: bool = False, adapter=None):
         """The same math as ``attention`` with the row-independent Triton kernels. ``floor``: no window key before
-        this position (bounded replay); ``kv_done``: the kv-source update already ran for these rows."""
+        this position (bounded replay); ``kv_done``: the kv-source update already ran for these rows; ``adapter``
+        (lora_runtime.RowAdapters): the rows' wo_b adapter deltas."""
 
         c = self.cfg
         n = x.shape[0]
@@ -1110,7 +1116,9 @@ class Model:
         if not ring_mode:
             keep = min(n, R)
             ring[pos[-keep:] % R] = kv[-keep:]
-        return mm(lay.wo_b, wo_a_out(lay, o), F32)
+        u = wo_a_out(lay, o)
+        out = mm(lay.wo_b, u, F32)
+        return out if adapter is None else adapter.wo_b(lay, u, out)
 
     def _neg(self, n: int) -> torch.Tensor:
         t = self.scratch.get(("neg", n))
@@ -1121,10 +1129,11 @@ class Model:
 
     # -- MoE -------------------------------------------------------------------------------------------------------
     def moe(self, lay, x: torch.Tensor, topk: int | None = None, img: torch.Tensor | None = None,
-            shared_side: bool = False) -> torch.Tensor:
+            shared_side: bool = False, adapter=None) -> torch.Tensor:
         """fp32 partial [n, d] of the MoE. ``shared_side`` (the decode bodies, which prefetch this layer's mHC mix and
         gate into L2 first): with SHARED_OVERLAP a decode window's shared expert runs on a side stream (_shared_side).
-        (Without the gate in L2 the side stream's DRAM traffic slows the gate's matmul by more than it overlaps.)"""
+        (Without the gate in L2 the side stream's DRAM traffic slows the gate's matmul by more than it overlaps.)
+        ``adapter`` (lora_runtime.RowAdapters): the rows' adapter deltas of the shared expert's w2."""
         c = self.cfg
         n = x.shape[0]
         topk = topk or c.topk
@@ -1167,10 +1176,14 @@ class Model:
         s = self._moe_scratch(lay, n, slots)
         if EXACT_MM:
             return self._moe_exact(lay, x, pick, wts)
-        shared = self._shared_apart(lay, x) if separate_shared else None
+        shared = self._shared_apart(lay, x, adapter) if separate_shared else None
         out = exl3_experts.routed(x.contiguous(), pick.contiguous(), wts, lay.experts, s, None, n,
                                   limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32, add=shared,
                                   before_down=side_done)
+        if adapter is not None and not separate_shared:
+            # the packed shared expert's rotated hidden is still in the scratch of the call that computed it
+            scratch = s if side_done is None else self.scratch[("moe_side", slots, lay.experts.count)]
+            adapter.shared(lay, scratch.xd[:n * slots].view(n, slots, -1)[:, slots - 1], out, packed=True)
         return out                                                        # fp32 partial [n, d]
 
     def _moe_scratch(self, lay, n: int, slots: int) -> "exl3_experts.Scratch":
@@ -1187,7 +1200,7 @@ class Model:
             self.scratch[skey] = s
         return s
 
-    def _shared_apart(self, lay, x: torch.Tensor) -> torch.Tensor:
+    def _shared_apart(self, lay, x: torch.Tensor, adapter=None) -> torch.Tensor:
         """Run a shared expert that has a dense or other-format projection outside the routed EXL3 pack."""
 
         w1, w3, w2 = lay.shared
@@ -1203,7 +1216,8 @@ class Model:
             h = K.clamped_swiglu(g.contiguous(), u.contiguous(), limit)
         else:
             h = (F.silu(g.float().clamp(max=limit)) * u.float().clamp(-limit, limit)).to(BF16)
-        return mm(w2, h, F32)
+        out = mm(w2, h, F32)
+        return out if adapter is None else adapter.shared(lay, h, out, packed=False)
 
     def _shared_side(self, lay, x: torch.Tensor, n: int, slots: int) -> torch.cuda.Event:
         """SHARED_OVERLAP: the shared expert of x's n rows on the side stream, from now on: exl3_experts.routed with
@@ -1265,15 +1279,18 @@ class Model:
     @torch.inference_mode()
     def forward(self, sc: SeqCache, ids: torch.Tensor, start: int, all_logits: bool = False,
                 taps: list | None = None, host_ids: list[int] | None = None, replay: int | None = None,
-                image: tuple | None = None):
+                image: tuple | None = None, adapter: int = 0):
         """Rows ids [n] at positions start.. of one sequence -> fp32 logits [n or 1, V] (both ranks the same).
         ``image``: (rows [k] long, embeddings [k, dim] bf16), this block's image-span rows: their embeddings replace the
         token's, the MoE gate picks their experts with its VL bias and Engram leaves them untouched (DeepSeek's
-        image_mask); ``host_ids`` then holds a negative id at each of them (no n-gram spans one)."""
+        image_mask); ``host_ids`` then holds a negative id at each of them (no n-gram spans one). ``adapter``: the
+        registry slot every row of this block runs (0: the stock model)."""
 
         c, w = self.cfg, self.w
         n = ids.shape[0]
         assert start == sc.length, (start, sc.length)
+        if adapter and (self.lora is None or not KERNELS):
+            raise ValueError("adapters run on the kernel path of an engine started with --adapter")
         sc.tokens[start:start + n] = ids
         emb = w.embed[ids].to(BF16)
         img = None
@@ -1291,7 +1308,7 @@ class Model:
             hashes = self.engram.hashes(sc.host.view(), start, n)                   # [n, L, cols] host
         shared: dict = {}
         if KERNELS:
-            return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay, img)
+            return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay, img, adapter)
         for lay in w.layers:
             if hashes is not None and lay.engram_wkv is not None:
                 h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)], img)
@@ -1316,7 +1333,8 @@ class Model:
         g = self.comm.gather(local)                                       # [world, n, V / world]
         return g.permute(1, 0, 2).reshape(local.shape[0], -1)
 
-    def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay=None, img=None):
+    def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay=None, img=None,
+                   adapter: int = 0):
         """``replay`` (decoder SWA bounded replay, CED's prefill): the decoder layers run only for rows at positions
         >= replay, their window truncated there; the first decoder layer's kv source still covers every row."""
 
@@ -1332,6 +1350,7 @@ class Model:
         comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
         floor, kv_done = 0, False
         h_alt = None                                             # (switch "hc_pf") the streams' second buffer
+        arow = self.lora.uniform(adapter, n) if adapter else None       # every row of the block runs one adapter
         self.taps_start = start
         for lay in w.layers:
             if replay is not None and lay.idx == c.n_layers // 2:
@@ -1356,6 +1375,7 @@ class Model:
                     pre_f = torch.empty((n, c.hc), dtype=F32, device=dev)
                     post = torch.empty((n, c.hc), dtype=F32, device=dev)
                     comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
+                    arow = self.lora.uniform(adapter, n) if adapter else None
                     self.taps_start = start
                 floor, kv_done = replay, True
             if hashes is not None and lay.engram_wkv is not None:
@@ -1375,7 +1395,7 @@ class Model:
                              comb, part)
             with _T("attn_r%d" % (2 if lay.comp_wkv is not None else 1 if lay.idx_wq_b is not None else 0)):
                 pa = self.attention_k(lay, x, sc, start, shared, pos, floor=floor,
-                                      kv_done=kv_done and lay.idx == c.n_layers // 2)
+                                      kv_done=kv_done and lay.idx == c.n_layers // 2, adapter=arow)
             with _T("gather"):
                 g = self.comm.gather(pa)
             with _T("hc"):
@@ -1392,7 +1412,7 @@ class Model:
                     K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post,
                              comb, part)
             with _T("moe"):
-                pm = self.moe(lay, x, img=img)
+                pm = self.moe(lay, x, img=img, adapter=arow)
             with _T("gather"):
                 g = self.comm.gather(pm)
             with _T("hc"):

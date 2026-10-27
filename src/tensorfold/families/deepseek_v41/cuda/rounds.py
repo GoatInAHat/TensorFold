@@ -80,9 +80,11 @@ class RoundDecoder:
         self.out = out                                  # (logits, taps) buffers the runner's graphs share (SHARED_OUT)
         c = model.cfg
         dev = "cuda"
-        self.inputs = torch.zeros((5, rows), dtype=torch.long, device=dev)  # one buffer, so one copy fills it
-        # ids, positions, slots, and the row's stream's extent (base, end) in positions
-        self.ids, self.pos, self.slot, self.base, self.end = self.inputs.unbind(0)
+        # one buffer, so one copy fills it: ids, positions, slots, the row's stream's extent (base, end) in positions
+        # and, in an engine that serves adapters, the row's adapter slot (read at replay by the adapter kernels)
+        self.inputs = torch.zeros((6 if model.lora is not None else 5, rows), dtype=torch.long, device=dev)
+        self.ids, self.pos, self.slot, self.base, self.end, *spare = self.inputs.unbind(0)
+        self.adapter = model.lora.bind(spare[0]) if spare else None
         self.end.fill_(1)
         self.table = SeqCache(cap=pool.cap)                                # RoPE tables for any pool position
         self.e_in = {}
@@ -217,7 +219,10 @@ class RoundDecoder:
         o = K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window,
                           wbase=wbase, cbase=cbase, ring_rows=RS)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        out = mm(lay.wo_b, wo_a_out(lay, o), F32)
+        u = wo_a_out(lay, o)
+        out = mm(lay.wo_b, u, F32)
+        if self.adapter is not None:
+            out = self.adapter.wo_b(lay, u, out)
         l2_fork(m, lay, "moe")                                          # the MoE's mHC mix, gate, shared expert
         return out
 
@@ -260,15 +265,18 @@ class RoundDecoder:
             suh, xh, gh = wo_a_rot(lay, n, x.device, hd)
             K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window,
                           wbase=wbase, cbase=cbase, ring_rows=RS, rot=(cos, sin, rd, suh, xh[0], gh))
-            out = wo_ab(lay, xh=xh, fold=K.on("rot_wob"))
+            out = wo_ab(lay, xh=xh, fold=K.on("rot_wob"), adapter=self.adapter)
         else:
             o = K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window,
                               wbase=wbase, cbase=cbase, ring_rows=RS)
             K.rope_heads(o, cos, sin, pos, rd, inverse=True)
             if K.on("rot_wob"):
-                out = wo_ab(lay, o)                          # wo_a's epilogue rotates for wo_b
+                out = wo_ab(lay, o, adapter=self.adapter)    # wo_a's epilogue rotates for wo_b
             else:
-                out = mm(lay.wo_b, wo_a_out(lay, o), F32)
+                u = wo_a_out(lay, o)
+                out = mm(lay.wo_b, u, F32)
+                if self.adapter is not None:
+                    out = self.adapter.wo_b(lay, u, out)
         l2_fork(m, lay, "moe")                                          # the MoE's mHC mix, gate, shared expert
         return out
 
@@ -438,7 +446,7 @@ class RoundDecoder:
                 fn, scale, base = lay.hc_ffn
                 K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb,
                          part)
-                y = m.moe(lay, x, shared_side=moe_side())           # the gate is in L2 by then
+                y = m.moe(lay, x, shared_side=moe_side(), adapter=self.adapter)    # the gate is in L2 by then
                 self._l2_next(li, end)
                 K.hc_post(m.comm.gather(y), h, post, comb, h)
                 pre, pre_f = pre_f, pre
@@ -541,7 +549,7 @@ class RoundDecoder:
             join()
             pending = m.comm.gather(y)
             h = pre_mix(h, lay.hc_ffn, pre_a, lay.ffn_norm, pre_f)
-            y = m.moe(lay, x, shared_side=moe_side())               # the gate is in L2 by then
+            y = m.moe(lay, x, shared_side=moe_side(), adapter=self.adapter)    # the gate is in L2 by then
             self._l2_next(li, end)
             join()
             pending = m.comm.gather(y)
@@ -567,11 +575,16 @@ class RoundDecoder:
         self.graphs = graphs
         self.graph = graphs[0]
 
-    def set(self, ids: list[int], pos: list[int], slots: list[int], base: list[int], end: list[int]) -> None:
+    def set(self, ids: list[int], pos: list[int], slots: list[int], base: list[int], end: list[int],
+            adapters: list[int] | None = None) -> None:
+        cols = [ids, list(pos), slots, base, end]
+        if self.adapter is not None:
+            cols.append(adapters if adapters is not None else [0] * len(ids))
         if ONE_COPY:                                    # pinned: the copy runs in stream order, nothing waits for it
-            self.inputs.copy_(torch.tensor([ids, list(pos), slots, base, end], dtype=torch.long).pin_memory(),
-                              non_blocking=True)
+            self.inputs.copy_(torch.tensor(cols, dtype=torch.long).pin_memory(), non_blocking=True)
             return
+        if self.adapter is not None:
+            self.adapter.rows.copy_(torch.tensor(cols[5], dtype=torch.long), non_blocking=False)
         self.ids.copy_(torch.tensor(ids, dtype=torch.long), non_blocking=False)
         self.pos.copy_(torch.tensor(pos, dtype=torch.long), non_blocking=False)
         self.slot.copy_(torch.tensor(slots, dtype=torch.long), non_blocking=False)
@@ -579,7 +592,7 @@ class RoundDecoder:
         self.end.copy_(torch.tensor(end, dtype=torch.long), non_blocking=False)
 
     def run(self, ids: list[int], pos: list[int], slots: list[int], base: list[int], end: list[int],
-            e_rows, e_start: dict | None = None) -> torch.Tensor:
+            e_rows, e_start: dict | None = None, adapters: list[int] | None = None) -> torch.Tensor:
         """``e_rows``: layer -> its Engram rows on the GPU, or a callable giving them (called just before the stretch
         that starts at that layer, so the read overlaps the stretches before it). ``e_start``: layer -> a callable that
         starts that layer's read, called once the stretch before the one that needs the rows is enqueued (before the
@@ -595,7 +608,7 @@ class RoundDecoder:
         from .multi import _ht
 
         _ht("fwd prep")
-        self.set(ids, pos, slots, base, end)
+        self.set(ids, pos, slots, base, end, adapters)
         _ht("fwd set")
         start(-1)
         for k, (first, _) in enumerate(self.stretches):
@@ -664,29 +677,34 @@ class RoundRunner:
                 _ht(f"touch {i} submitted")
 
     def forward(self, windows: list[tuple], replay: bool = True) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """``windows``: each stream's (slot, extent base, extent size, first position, token ids, host ids so far):
-        rows in that order. Returns logits [R, V] and taps [R, 3 d] (the rows in window order; with SHARED_OUT views of
-        the runner's pair, valid until its next forward); ``replay=False``
+        """``windows``: each stream's (slot, extent base, extent size, first position, token ids, host ids so far[,
+        adapter slot]): rows in that order. Returns logits [R, V] and taps [R, 3 d] (the rows in window order; with
+        SHARED_OUT views of the runner's pair, valid until its next forward); ``replay=False``
         only captures a missing graph (warm-up) and returns (None, None)."""
 
         m = self.m
-        ids, pos, slots, base, end = [], [], [], [], []
+        ids, pos, slots, base, end, adapters = [], [], [], [], [], []
         hashes = []
-        for slot, b0, size, p0, toks, host in windows:
+        for slot, b0, size, p0, toks, host, *more in windows:
             n = len(toks)
             ids += toks
             pos += range(p0, p0 + n)
             slots += [slot] * n
             base += [b0] * n
             end += [b0 + size] * n
+            adapters += [more[0] if more else 0] * n
             if m.engram is not None:
                 hashes.append(m.engram.hashes(host, p0, n))
+        if any(adapters) and m.lora is None:
+            raise ValueError("a stream asks for an adapter, and this engine was started without one")
         R = len(ids)
         b = self.bucket(max(p + 1 for p in pos))
         Rg = R
         if self.graphs is not None:                        # also a capture-only call: it makes the key a round uses
             Rg = padded_rows(R, sizes_for(b, self.sizes, self.sizes_long))
-            for col in (ids, pos, slots, base, end):       # the extra rows copy the last row (graph_keys.ROUND_ROWS)
+            # the extra rows copy the last row (graph_keys.ROUND_ROWS): its adapter too, or the copy would write
+            # other values into the cache rows its original writes
+            for col in (ids, pos, slots, base, end, adapters):
                 col += col[-1:] * (Rg - R)
         e_rows = e_start = None
         if m.engram is not None and replay:
@@ -712,7 +730,7 @@ class RoundRunner:
         g = self.graphs.get(key) if self.graphs is not None else None
         if g is None:
             g = RoundDecoder(m, self.pool, Rg, b, True, out=self.out)
-            g.set(ids, pos, slots, base, end)
+            g.set(ids, pos, slots, base, end, adapters)
             if self.graphs is not None:
                 if self.graph_pool is None:
                     self.graph_pool = torch.cuda.graph_pool_handle()
@@ -723,5 +741,5 @@ class RoundRunner:
                 self.graphs[key] = g
         if not replay:
             return None, None
-        out = g.run(ids, pos, slots, base, end, e_rows, e_start)
+        out = g.run(ids, pos, slots, base, end, e_rows, e_start, adapters)
         return out[:R], (None if g.taps is None else g.taps[:R])

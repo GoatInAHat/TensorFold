@@ -54,6 +54,7 @@ from tensorfold.engine.grammar import pack as pack_grammar
 
 from ..ops import HostIds
 from . import constrain, memtrace
+from .lora_registry import AdapterRef, key_of, slot_of
 from .model import RAW
 
 # "conf", "fixed", "even": the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the
@@ -444,12 +445,15 @@ class Kept:
     """A finished stream's prompt kept in the window: positions [base, base + size) hold the compressed and indexer
     rows (and token ids) of its first ``top`` prompt tokens; ``snaps`` its slot's rings and compressor inputs at each
     kept chunk boundary; ``host`` the prompt's host ids to ``top`` (Engram's n-grams); ``keys`` (rank 0 only) the
-    prompt's ids to ``top`` with each image span's positions keyed by its picture; ``tick`` when it was last used."""
+    prompt's ids to ``top`` with each image span's positions keyed by its picture; ``tick`` when it was last used;
+    ``adapter`` the identity key of the adapter whose forward made the rows ('' for the stock model): only a prompt
+    of the same adapter continues it."""
 
     def __init__(self, eid: int, base: int, size: int, top: int, host: list, snaps: dict, replay: bool, keys,
-                 tick: int) -> None:
+                 tick: int, adapter: str = "") -> None:
         self.eid, self.base, self.size, self.top, self.host = eid, base, size, top, host
         self.snaps, self.replay, self.keys, self.tick, self.hits = snaps, replay, keys, tick, 0
+        self.adapter = adapter
         self.disk: dict | None = None                    # its spilled manifest (TF_DS_SPILL_GIB), when written
 
 
@@ -695,9 +699,11 @@ class MultiDecoder:
 
     def _shape(self) -> list:
         return [self.next_id, list(self.free), list(self.extents.gaps),
-                [[s.sid, s.st.index, s.st.sc.length, len(s.out), bool(s.done)] for s in self.streams.values()],
-                [[s.sid, s.st.index, s.filled] for s in self.filling],
-                [[k.eid, k.base, k.size, k.top, k.tick, sorted(k.snaps)] for k in self.kept.values()]]
+                [[s.sid, s.st.index, s.st.sc.length, len(s.out), bool(s.done)] + ([slot_of(s)] if slot_of(s) else [])
+                 for s in self.streams.values()],
+                [[s.sid, s.st.index, s.filled] + ([slot_of(s)] if slot_of(s) else []) for s in self.filling],
+                [[k.eid, k.base, k.size, k.top, k.tick, sorted(k.snaps)] + ([k.adapter] if k.adapter else [])
+                 for k in self.kept.values()]]
 
     # -- kept prompts ---------------------------------------------------------------------------------------------
     def _replay(self) -> bool:
@@ -726,7 +732,7 @@ class MultiDecoder:
         limit = len(s.prompt) - (self.m.cfg.window if replay else 1)
         best = None
         for k in self.kept.values():
-            if k.replay != replay or k.keys is None:
+            if k.replay != replay or k.keys is None or k.adapter != key_of(s):   # (only the same adapter's rows)
                 continue
             n = min(len(k.keys), len(keys))
             diff = np.flatnonzero(k.keys[:n] != keys[:n])
@@ -884,14 +890,14 @@ class MultiDecoder:
             self.extents.give(s.base + size, s.size - size)
         keys = getattr(s, "keys", None)
         k = Kept(self.next_kept, s.base, size, top, s.st.sc.host.copy(top), {b: s.snaps[b] for b in marks},
-                 self._replay(), None if keys is None else keys[:top], self.ticks)
+                 self._replay(), None if keys is None else keys[:top], self.ticks, key_of(s))
         self.kept[k.eid] = k
         self.next_kept += 1
         if self.spill is not None:                       # write-through: its rows past what its lineage holds
             with memtrace.phase("spill-save"):
                 k.disk = self.spill.persist(f"{self.spill_nonce or 'run'}-{k.eid:06d}", base=k.base, top=k.top,
                                             replay=k.replay, snaps=k.snaps, host=k.host,
-                                            lineage=getattr(s, "lineage", None), keys=k.keys)
+                                            lineage=getattr(s, "lineage", None), keys=k.keys, adapter=k.adapter)
         s.st.sc = None
         s.snaps = None
 
@@ -910,7 +916,7 @@ class MultiDecoder:
             top = max(marks)
             for k in self.kept.values():
                 if (k.eid not in drops and k.keys is not None and k.top <= top and k.replay == self._replay()
-                        and set(k.snaps) <= marks and np.array_equal(k.keys, keys[:k.top])):
+                        and k.adapter == key_of(s) and set(k.snaps) <= marks and np.array_equal(k.keys, keys[:k.top])):
                     drops.append(k.eid)
         return drops
 
@@ -923,6 +929,8 @@ class MultiDecoder:
 
         if s.probabilities is not None:
             raise ValueError("logprobs are not served with --parallel on DeepSeek-V4.1")
+        if s.adapter is not None and not self.e.adapter_ok(s.adapter):
+            raise ValueError("this request names an adapter the engine does not hold")
         room = self.extents.total - len(s.prompt) - self.max_rows - 8 - 4
         if room < 1:
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.extents.total}-token "
@@ -939,12 +947,22 @@ class MultiDecoder:
         reuse = self._match(s, s.keys) if KEEP and self.kept else None
         if self.spill is not None and s.keys is not None:   # a spilled boundary past every kept prompt's
             far = self.spill.best(s.keys, len(s.prompt), window=self.m.cfg.window, replay=self._replay(),
-                                  above=int(reuse[1]) if reuse else 0)
+                                  above=int(reuse[1]) if reuse else 0, adapter=key_of(s))
             if far is not None:
                 reuse = ["disk", far[0], far[1]]
+        # (a stock request's op is the one it always was: the adapter's slot and key ride after the grammar)
         self._send(["admit", list(s.prompt), s.count, _pack(s.sampling), bool(s.draft), bool(s.stop_eos), index,
-                    positions, reuse, pack_grammar(s.constraint)])
+                    positions, reuse, pack_grammar(s.constraint)] + self._adapter_plan(s))
         self._admit(s, index, positions, reuse)
+
+    def _adapter_plan(self, s: Stream, check: bool = False) -> list:
+        """[] for the stock model, else [[slot, key]] (with ``check``, [slot, key, whether this rank holds that adapter]:
+        a rank that does not makes the step's digests differ, and the step fails on every rank)."""
+
+        ref = s.adapter
+        if ref is None:
+            return []
+        return [[int(ref.slot), str(ref.key)] + ([bool(self.e.adapter_ok(ref))] if check else [])]
 
     def _need(self, s: Stream) -> int:
         """A stream's positions: its prompt, its reply, a round's rows and its extent's scratch row (a group long)."""
@@ -961,7 +979,8 @@ class MultiDecoder:
         self._step(True)
         try:
             self._agree("admission", [self._shape(), list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
-                                      bool(s.stop_eos), index, positions, reuse, pack_grammar(s.constraint)])
+                                      bool(s.stop_eos), index, positions, reuse, pack_grammar(s.constraint)]
+                        + self._adapter_plan(s, check=True))
             self.ticks += 1
             need = self._need(s)
             disk = bool(reuse) and reuse[0] == "disk"
@@ -1038,8 +1057,9 @@ class MultiDecoder:
                     if end in marks:
                         s.snaps[end] = self._snapshot(index)
 
+            held = {} if s.adapter is None else {"adapter": slot_of(s)}       # (a stock prompt's call is as it was)
             s.steps = e.prefill_steps(slot.sc, slot.dc if s.draft else None, list(s.prompt), image, start=cut,
-                                      snap=snap)
+                                      snap=snap, **held)
             s.filled, s.prefill_s, s.cached = cut, 0.0, cut
             self.filling.append(s)
         except Exception as exc:
@@ -1384,7 +1404,8 @@ class MultiDecoder:
                         self._stream_failed(s, exc)
                 window = [s.pending] + drafts
                 sc.host.set(P, window)
-                windows.append((s.st.index, s.base, s.size, P, window, sc.host.view()))
+                windows.append((s.st.index, s.base, s.size, P, window, sc.host.view())
+                               + (() if s.adapter is None else (slot_of(s),)))
                 kept.append((s, P, drafts))
             _ht("drafts back + plan")
             logits, taps = self.runner.forward(windows)
@@ -1392,7 +1413,7 @@ class MultiDecoder:
             absorb_done = None
             if EAGER_ABSORB and taps is not None:
                 eager, r = [], 0
-                for (s, P, _), (_, _, _, _, window, _) in zip(kept, windows):
+                for (s, P, _), (_, _, _, _, window, *_) in zip(kept, windows):
                     if s.draft:
                         eager.append((s.st.index, taps[r:r + len(window)], P))
                     r += len(window)
@@ -1402,7 +1423,7 @@ class MultiDecoder:
             done, r0, tokens = [], 0, 0
             t_absorb = 0.0
             absorbs = []
-            for (s, P, drafts), (_, _, _, _, window, _) in zip(kept, windows):
+            for (s, P, drafts), (_, _, _, _, window, *_) in zip(kept, windows):
                 n = len(window)
                 if not s.done:                           # (a stream that failed before the forward: its rows, no tokens)
                     try:
@@ -1598,9 +1619,10 @@ class MultiDecoder:
             kind = op[0]
             try:
                 if kind == "admit":
-                    _, prompt, count, sampling, draft, stop_eos, index, positions, reuse, packed = op
+                    _, prompt, count, sampling, draft, stop_eos, index, positions, reuse, packed, *held = op
                     s = Stream(list(prompt), int(count), _unpack(sampling), draft=bool(draft), stop_eos=bool(stop_eos),
-                               constraint=constrain.follow(self.e, packed))
+                               constraint=constrain.follow(self.e, packed),
+                               adapter=AdapterRef(int(held[0][0]), str(held[0][1])) if held else None)
                     s.emit = lambda new: None
                     s.keys = None
                     self._admit(s, int(index), list(positions), reuse)

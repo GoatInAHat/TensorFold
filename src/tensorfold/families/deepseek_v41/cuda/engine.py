@@ -67,7 +67,8 @@ WARM_LENGTHS = tuple(int(v) for v in (os.environ.get("TF_DS_WARM_LENGTHS") or
 class DsEngine:
     def __init__(self, model_dir: Path, *, rank: int, world: int, master: str, port: int, drafts: int = 3,
                  context: int | None = None, engram_dir: str | None = None, vision: bool = False,
-                 vision_urls: bool = False, parallel: int = 1) -> None:
+                 vision_urls: bool = False, parallel: int = 1, adapters: list | None = None,
+                 adapter_reserved: tuple = ()) -> None:
         from tensorfold.cuda.comm import NCCL
 
         from ..ops import compressed_token_map
@@ -106,6 +107,8 @@ class DsEngine:
         elif rank == 0:
             print("[tensorfold] WARNING: no Engram tables (TF_DS_ENGRAM): output will be degraded", flush=True)
         self.model = Model(self.w, Comm(nccl, world, rdma_bytes=int(RDMA_MB * (1 << 20)) // 64 * 64), eng)
+        # --adapter: the registry and every rank's share of the factors, before the pools and the warm-up size anything
+        self.adapters = self._load_adapters(adapters, adapter_reserved, parallel) if adapters else None
         # images (--vision): the tower runs on rank 0, which shares each image span's rows; every rank routes the span
         # with the gates' VL bias and keeps Engram out of it
         self.vision = None
@@ -160,14 +163,16 @@ class DsEngine:
             from . import markov
 
             nccl.barrier()                               # the Markov switches set the drafter's gathers (count, size)
-            mine = torch.tensor([int(self.vcfg is not None), int(parallel), int(markov.ON), int(markov.SPLIT)],
+            mine = torch.tensor([int(self.vcfg is not None), int(parallel), int(markov.ON), int(markov.SPLIT),
+                                 *(self.adapters.words() if self.adapters else [0, 0, 0, 0])],
                                 dtype=torch.int64, device="cuda")
-            every = torch.empty((world * 4,), dtype=torch.int64, device="cuda")
+            every = torch.empty((world * 8,), dtype=torch.int64, device="cuda")
             nccl.all_gather(mine, every)
-            flags = every.view(world, 4).tolist()
+            flags = every.view(world, 8).tolist()
             if any(f != flags[0] for f in flags):
-                raise ValueError("--vision, --parallel, TF_DS_MARKOV and TF_DS_MARKOV_SPLIT must be the same on every "
-                                 f"rank (rank 0 and the workers run the same steps): {flags}")
+                raise ValueError("--vision, --parallel, TF_DS_MARKOV, TF_DS_MARKOV_SPLIT and the --adapter files, "
+                                 "names and strengths must be the same on every rank (rank 0 and the workers run "
+                                 f"the same steps): {flags}")
         if WARM:
             self.warm()
         if self.concurrent:
@@ -188,8 +193,51 @@ class DsEngine:
         self._memory_ceiling()
         memtrace.start(rank)
         if rank == 0:
+            held = f", adapters {', '.join(self.adapters.names())}" if self.adapters else ""
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
-                  f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
+                  f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}{held}", flush=True)
+
+    def _load_adapters(self, specs: list, reserved: tuple, parallel: int):
+        """The adapter registry (validated against this checkpoint) and this rank's factors on the GPU; every kernel
+        they launch is built here. Refused where a row's slot cannot reach the forward: one stream at a time, the
+        torch path (TF_DS_KERNELS=0) and the exact-matmul test mode."""
+
+        from . import lora_runtime
+        from . import model as _model
+        from .hostenv import meminfo_gib
+        from .lora_registry import AdapterRegistry
+
+        if int(parallel) < 2:
+            raise ValueError("--adapter needs --parallel 2 or more: adapters ride the concurrent rounds' per-row inputs")
+        if not _model.KERNELS or _model.EXACT_MM:
+            raise ValueError("--adapter runs on the kernel path: TF_DS_KERNELS=0 and TF_DS_EXACT_MM=1 are test modes")
+        registry = AdapterRegistry.load(specs, self.w.cfg, self.model_dir, reserved)
+        floor = float(os.environ.get("TF_DS_MEM_FLOOR_GIB") or 2.0)
+
+        def room() -> float | None:                      # GiB above the floor, a gigabyte kept for the warm-up
+            free = meminfo_gib("MemAvailable")
+            return None if free is None else free - floor - 1.0
+
+        runtime = lora_runtime.LoraRuntime.load(registry, self.w, self.rank, self.world, room=room)
+        self.model.lora = runtime
+        runtime.warm()
+        return registry
+
+    def adapter_ok(self, ref) -> bool:
+        """Whether this engine holds exactly the adapter ``ref`` names (the stock model always)."""
+
+        return ref is None or (self.adapters is not None and self.adapters.check(ref))
+
+    def adapter_ref(self, name: str | None):
+        """The reference a request's adapter name resolves to (None: the stock model); UnknownAdapter if not held."""
+
+        from .lora_registry import UnknownAdapter
+
+        if name is None:
+            return None
+        if self.adapters is None:
+            raise UnknownAdapter(f"no adapter named {name!r}: this server was started without --adapter")
+        return self.adapters.ref(name)
 
     def _nccl_host_env(self) -> None:
         """NCCL's cuMem allocations off and its GID index set (hostenv.py); a value that the user set stays."""
@@ -347,15 +395,18 @@ class DsEngine:
         return [int(v) for v in allv[:count].tolist()]
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None, vision=None, **_: Any) -> dict[str, Any]:
+                 constraint=None, vision=None, adapter: str | None = None, **_: Any) -> dict[str, Any]:
         from tensorfold.engine.grammar import pack
 
         stop_eos = bool(getattr(self.request, "stop_eos", True))
+        ref = self.adapter_ref(adapter)
         if self.scheduler is not None:
             if vision is not None and getattr(vision, "spans", None) and self.tower is None:
                 raise ValueError("image input needs the server started with --vision")
             return self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft), on_tokens,
-                                         stop_eos=stop_eos, vision=vision, constraint=constraint)
+                                         stop_eos=stop_eos, vision=vision, constraint=constraint, adapter=ref)
+        if ref is not None:
+            raise ValueError("adapters are served by the concurrent engine (--parallel 2 or more)")
         positions, rows = [], None
         if vision is not None and getattr(vision, "spans", None):
             if self.tower is None:
@@ -412,22 +463,24 @@ class DsEngine:
 
         return sample_rows(logits, positions, sampling)
 
-    def prefill(self, sc, dc, prompt: list[int], image: tuple | None = None) -> torch.Tensor:
+    def prefill(self, sc, dc, prompt: list[int], image: tuple | None = None, adapter: int = 0) -> torch.Tensor:
         """The prompt into ``sc`` (and the drafter's cache ``dc``, when given) in PREFILL_CHUNK chunks: the last row's
         logits. ``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16)."""
 
-        steps = self.prefill_steps(sc, dc, prompt, image)
+        steps = self.prefill_steps(sc, dc, prompt, image, adapter=adapter)
         while True:
             try:
                 next(steps)
             except StopIteration as done:
                 return done.value
 
-    def prefill_steps(self, sc, dc, prompt: list[int], image: tuple | None = None, start: int = 0, snap=None):
+    def prefill_steps(self, sc, dc, prompt: list[int], image: tuple | None = None, start: int = 0, snap=None,
+                      adapter: int = 0):
         """``prefill`` one chunk a step (a generator: each ``next`` runs one chunk; its return value is the last
         row's logits), so a concurrent lane can decode between a long prompt's chunks. ``start`` (a chunk boundary):
         the caches already hold the prompt's rows before it, a kept prompt's (``multi``), and its chunks are a fresh
-        prefill's own from there; ``snap(end)`` runs after each chunk that ends on a chunk boundary."""
+        prefill's own from there; ``snap(end)`` runs after each chunk that ends on a chunk boundary. ``adapter``: the
+        registry slot the prompt's rows run (0: stock)."""
 
         m = self.model
         assert start % PREFILL_CHUNK == 0 and start < len(prompt), (start, len(prompt))
@@ -469,7 +522,7 @@ class DsEngine:
                 if i1 > i0:
                     block = (pos_dev[i0:i1] - s, rows[i0:i1])
             tc = time.perf_counter()
-            out = m.forward(sc, ids, s, taps=taps, host_ids=host[s:e], replay=replay, image=block)
+            out = m.forward(sc, ids, s, taps=taps, host_ids=host[s:e], replay=replay, image=block, adapter=adapter)
             if ENGRAM_DONTNEED and m.engram is not None and _drop_busy.acquire(blocking=False):
                 fds = sorted({f[0] for f in m.engram.files.values()})
                 threading.Thread(target=_drop_pages, args=(fds,), daemon=True).start()

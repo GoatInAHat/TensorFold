@@ -12,6 +12,7 @@ from typing import Any
 MODEL_TYPES = ("deepseek_v41",)
 TITLE = "DeepSeek-V4.1-Flash"
 CUDA_VISION = True          # --vision: the tower and image spans are this family's own (cuda/vision.py)
+CUDA_ADAPTERS = True        # --adapter: LoRA adapters on attention wo_b and the shared expert's w2 (docs/adapters.md)
 LANES = False
 MODELS = ("Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw",)
 QUANT_METHODS = {"cuda": ("exl3",)}
@@ -60,7 +61,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 2, rank: 
     engine = DsEngine(Path(model_dir), rank=int(rank), world=int(tp), master=master, port=int(master_port),
                       drafts=drafts, context=options.get("context"), engram_dir=os.environ.get("TF_DS_ENGRAM") or None,
                       vision=bool(options.get("vision")), vision_urls=bool(options.get("vision_urls")),
-                      parallel=int(options.get("parallel") or 1))
+                      parallel=int(options.get("parallel") or 1), adapters=options.get("adapters"),
+                      adapter_reserved=tuple(options.get("adapter_reserved") or ()))
     fp32_gemms()
     return engine
 
