@@ -24,8 +24,9 @@ already makes; no collective is added.
 
 Everything else is refused when the server starts, by name: routed experts, the router, the shared expert's gate and up
 projections, other attention projections, the compressor and indexer, embeddings, the head, norms, hyper-connection
-parameters, Engram, the vision tower, and every MTP/DSpark block (`mtp.*`). A file that is not a plain LoRA pair
-(DoRA magnitudes, biases, full weights, `modules_to_save`, `fan_in_fan_out`, layer replication) is refused too. Nothing is
+parameters, Engram, the vision tower, and every MTP/DSpark block (`mtp.*`). A file that is not a plain, always-on LoRA
+pair (DoRA magnitudes, biases, full weights, `modules_to_save`, `fan_in_fan_out`, layer replication, and PEFT's
+activated LoRA, whose `alora_invocation_tokens` make it edit only after those tokens) is refused too. Nothing is
 dropped quietly. The drafter always runs the base model, so an adapted reply is still the adapted target's own: drafts
 are verified against it, and a weaker draft only costs acceptance.
 
@@ -42,7 +43,9 @@ PEFT's two files, and optionally a manifest:
   {"sha256": ...}}, "base": {"model_type": ..., "hidden_size": ..., "num_hidden_layers": ..., "config_sha256": ...},
   "modules": {"layers.10.attn.wo_b": {"rank": 2}, ...}, "provenance": {...}}`. What it declares must match the files
   (the weights' hash, the base model, and exactly this set of modules at exactly these ranks), or the server does not
-  start. Without it the same checks run on what the files say; either way the normalized manifest is what the server holds.
+  start; a member of another type than the one shown (`files`, `base` or `provenance` not an object) is refused the same
+  way. Without it the same checks run on what the files say; either way the normalized manifest is what the server
+  holds.
 
 At load, a rank component whose A row or B column is all zero is dropped (its product is exactly zero), and a module
 with nothing left is left out; a value that is not finite is refused.

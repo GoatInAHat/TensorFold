@@ -169,6 +169,32 @@ def test_a_pattern_that_is_not_a_regex_is_refused(tmp_path):
     refuse(tmp_path, "not a pattern", config={"alpha_pattern": {"(": 1}})
 
 
+@pytest.mark.parametrize("tokens", [[1, 2, 3], [128000], []])
+def test_an_activated_lora_is_refused_rather_than_served_always_on(tmp_path, tokens):
+    refuse(tmp_path, "alora_invocation_tokens is set", config={"alora_invocation_tokens": tokens})
+
+
+def test_the_null_peft_writes_for_a_plain_lora_is_not_an_activated_one(tmp_path):
+    spec = lf.inspect_folder(standard(tmp_path / "a", config={"alora_invocation_tokens": None}), DIMS)
+    assert [m.rank for m in spec.modules] == [2, 3]
+
+
+@pytest.mark.parametrize("config,match", [
+    ({"rank_pattern": ["wo_b"]}, "rank_pattern must be an object"),
+    ({"rank_pattern": "wo_b"}, "rank_pattern must be an object"),
+    ({"alpha_pattern": 5}, "alpha_pattern must be an object"),
+    ({"alpha_pattern": {"wo_b": "8"}}, "alpha_pattern gives '8'"),
+    ({"alpha_pattern": {"wo_b": [8]}}, "alpha_pattern gives \\[8\\]"),
+    ({"alpha_pattern": {"wo_b": True}}, "alpha_pattern gives True"),
+    ({"alpha_pattern": {"wo_b": float("inf")}}, "alpha_pattern gives inf"),
+    ({"lora_alpha": float("nan")}, "lora_alpha must be"),
+    ({"lora_alpha": float("inf")}, "lora_alpha must be"),
+    ({"lora_alpha": 10 ** 400}, "lora_alpha must be"),                         # an integer no float can hold
+])
+def test_config_values_of_the_wrong_shape_are_refused_with_the_reason(tmp_path, config, match):
+    refuse(tmp_path, match, config=config)
+
+
 def test_rank_over_the_limit_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(lf, "MAX_RANK", 1)
     refuse(tmp_path, "outside 1..1", {WO_B.format(1): factors(rng(), CFG.dim, WO_IN, 2)})
@@ -215,6 +241,49 @@ def test_overlapping_tensors_are_refused(tmp_path):
         lf.inspect_folder(folder, DIMS)
 
 
+def header_of(folder):
+    blob = (folder / lf.WEIGHTS).read_bytes()
+    return json.loads(blob[8:8 + struct.unpack("<Q", blob[:8])[0]])
+
+
+def set_header(folder, header):
+    """Rewrite the weights file's header JSON (text, or an object to dump); the tensors' bytes stay as they were."""
+
+    path = folder / lf.WEIGHTS
+    blob = path.read_bytes()
+    raw = (header if isinstance(header, str) else json.dumps(header)).encode()
+    raw += b" " * (-len(raw) % 8)
+    path.write_bytes(struct.pack("<Q", len(raw)) + raw + blob[8 + struct.unpack("<Q", blob[:8])[0]:])
+
+
+@pytest.mark.parametrize("text", ["[]", '["dtype", "shape"]', '"x"', "7", "null", "true"])
+def test_a_header_that_is_not_an_object_is_refused(tmp_path, text):
+    folder = standard(tmp_path / "a")
+    set_header(folder, text)
+    with pytest.raises(lf.AdapterError, match="header is not an object"):
+        lf.inspect_folder(folder, DIMS)
+
+
+GOOD = {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]}
+
+
+@pytest.mark.parametrize("entry,match", [
+    (["F32", [2, 2], [0, 16]], "malformed entry"), ("F32", "malformed entry"), (None, "malformed entry"),
+    ({**GOOD, "dtype": ["F32"]}, "served as F32, F16 or BF16"), ({**GOOD, "dtype": {"F32": 1}}, "served as F32"),
+    ({**GOOD, "dtype": None}, "served as F32"), ({**GOOD, "shape": 4}, "malformed entry"),
+    ({**GOOD, "shape": [float("inf"), 2]}, "malformed entry"), ({**GOOD, "data_offsets": [0]}, "malformed entry"),
+    ({**GOOD, "data_offsets": [0, float("inf")]}, "malformed entry"),
+    ({k: v for k, v in GOOD.items() if k != "shape"}, "malformed entry"),
+])
+def test_a_tensor_entry_of_the_wrong_shape_is_refused(tmp_path, entry, match):
+    folder = standard(tmp_path / "a")
+    head = header_of(folder)
+    head[next(k for k in head if k != "__metadata__")] = entry
+    set_header(folder, head)
+    with pytest.raises(lf.AdapterError, match=match):
+        lf.inspect_folder(folder, DIMS)
+
+
 # -- the manifest ------------------------------------------------------------------------------------------------
 def declared(folder, **over):
     spec = lf.inspect_folder(folder, DIMS)
@@ -248,6 +317,11 @@ def test_a_declared_manifest_that_agrees_is_accepted_and_kept(tmp_path):
     ({"modules": {"layers.1.attn.wo_b": {"rank": 2}, "layers.2.ffn.shared_experts.w2": {"rank": 3},
                   "layers.3.attn.wo_b": {"rank": 1}}}, "declared but absent"),
     ({"modules": []}, "modules must be an object"),
+    ({"files": "x"}, "files must be an object"),                           # not skipped: the hash would go unchecked
+    ({"files": {lf.WEIGHTS: ["0" * 64]}}, "files.adapter_model.safetensors must be an object"),
+    ({"base": "deepseek_v41"}, "base must be an object"),
+    ({"base": 7}, "base must be an object"),
+    ({"provenance": "made by hand"}, "provenance must be an object"),
 ])
 def test_a_manifest_that_disagrees_with_the_files_refuses_the_adapter(tmp_path, change, match):
     folder = standard(tmp_path / "a")

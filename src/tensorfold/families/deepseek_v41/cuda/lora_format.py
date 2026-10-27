@@ -33,8 +33,8 @@ _PREFIXES = ("base_model.model.model.", "base_model.model.", "model.")
 _KIND_NAMES = ((WO_B, re.compile(r"layers\.(\d+)\.attn\.wo_b")),
                (SHARED_W2, re.compile(r"layers\.(\d+)\.ffn\.shared_experts\.w2")))
 _LORA = re.compile(r"(?P<module>.+)\.lora_(?P<part>[AB])\.weight")
-_REFUSED = ("PEFT writes this field when the adapter is DoRA, has a bias, trains other modules or replicates layers; "
-            "none of those is served")
+_REFUSED = ("PEFT writes this field when the adapter is DoRA, has a bias, trains other modules, replicates layers or "
+            "is an activated LoRA; none of those is served")
 
 
 class AdapterError(ValueError):
@@ -136,14 +136,16 @@ def read_header(path: str | Path) -> tuple[dict[str, dict], int]:
             header = json.loads(f.read(n))
         except ValueError as exc:
             raise AdapterError(f"{path}: unreadable safetensors header ({exc})") from exc
+    if not isinstance(header, dict):
+        raise AdapterError(f"{path}: the safetensors header is not an object")
     header.pop("__metadata__", None)
     end, spans = size - 8 - n, []
     for name, e in header.items():
         try:
             dtype, shape, (lo, hi) = e["dtype"], [int(v) for v in e["shape"]], [int(v) for v in e["data_offsets"]]
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:       # OverflowError: Infinity or 1e999
             raise AdapterError(f"{path}: tensor {name!r} has a malformed entry") from exc
-        if dtype not in DTYPES:
+        if not isinstance(dtype, str) or dtype not in DTYPES:
             raise AdapterError(f"{path}: tensor {name!r} is {dtype}; adapters are served as F32, F16 or BF16")
         count = math.prod(shape)
         if min(shape, default=1) < 0 or not 0 <= lo <= hi <= end or hi - lo != count * DTYPES[dtype]:
@@ -189,10 +191,32 @@ def _classify(module: str) -> tuple[int, str]:
                        "of a backbone layer; MTP, routed-expert, router, embedding, head and norm edits are refused)")
 
 
+def _real(value: Any) -> float | None:
+    """``value`` as a finite float; None for a bool, a string or anything else that is not a finite number."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:                                  # an integer no float can hold
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _object(value: Any, where: Path | str, what: str) -> Mapping[str, Any]:
+    """A JSON member that must be an object when it is present (absent: empty)."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise AdapterError(f"{where}: {what} must be an object")
+    return value
+
+
 def _pattern(table: Any, module: str, what: str) -> Any:
     """PEFT's rank_pattern / alpha_pattern value for a module: the first key that matches it, else None."""
 
-    for key, value in (table or {}).items():
+    for key, value in _object(table, CONFIG, what).items():
         try:
             if re.fullmatch(rf"(?:.*\.)?(?:{key})", module) or re.fullmatch(rf"(?:.*\.)?(?:{key})",
                                                                             "base_model.model." + module):
@@ -213,11 +237,15 @@ def read_config(folder: Path) -> dict[str, Any]:
                 "target_parameters", "trainable_token_indices"):
         if cfg.get(key):
             raise AdapterError(f"{folder / CONFIG}: {key} is set. {_REFUSED}")
+    # null is a plain LoRA; any other value is PEFT's activated LoRA, which edits only after its invocation tokens
+    if cfg.get("alora_invocation_tokens") is not None:
+        raise AdapterError(f"{folder / CONFIG}: alora_invocation_tokens is set. {_REFUSED}")
     if str(cfg.get("bias", "none")) != "none":
         raise AdapterError(f"{folder / CONFIG}: bias is {cfg['bias']!r}. {_REFUSED}")
     for key in ("r", "lora_alpha"):
-        if not isinstance(cfg.get(key), (int, float)) or isinstance(cfg.get(key), bool) or cfg[key] <= 0:
-            raise AdapterError(f"{folder / CONFIG}: {key} must be a positive number")
+        number = _real(cfg.get(key))
+        if number is None or number <= 0:
+            raise AdapterError(f"{folder / CONFIG}: {key} must be a finite positive number")
     return cfg
 
 
@@ -240,11 +268,12 @@ def _check_manifest(manifest: Mapping[str, Any], folder: Path, sha: str, modules
 
     if not manifest:
         return
-    files = manifest.get("files") or {}
-    want = (files.get(WEIGHTS) or {}).get("sha256") if isinstance(files, dict) else None
+    files = _object(manifest.get("files"), folder / MANIFEST, "files")
+    want = _object(files.get(WEIGHTS), folder / MANIFEST, f"files.{WEIGHTS}").get("sha256")
     if want is not None and want != sha:
         raise AdapterError(f"{folder / MANIFEST}: {WEIGHTS} hashes to {sha}, the manifest says {want}")
-    base = manifest.get("base") or {}
+    base = _object(manifest.get("base"), folder / MANIFEST, "base")
+    _object(manifest.get("provenance"), folder / MANIFEST, "provenance")       # --write-manifest copies it
     for key, have in (("model_type", "deepseek_v41"), ("hidden_size", dims.dim), ("num_hidden_layers", dims.n_layers)):
         if key in base and base[key] != have:
             raise AdapterError(f"{folder / MANIFEST}: base {key} is {base[key]!r}, this model's is {have!r}")
@@ -306,8 +335,10 @@ def inspect_folder(folder: str | Path, dims: Dims, *, config_sha: str | None = N
         want = cfg["r"] if want is None else want
         if want != rank:
             raise AdapterError(f"{module}: the tensors have rank {rank}, {CONFIG} says {want}")
-        alpha = _pattern(cfg.get("alpha_pattern"), module, "alpha_pattern")
-        alpha = float(cfg["lora_alpha"] if alpha is None else alpha)
+        given = _pattern(cfg.get("alpha_pattern"), module, "alpha_pattern")
+        alpha = _real(cfg["lora_alpha"] if given is None else given)
+        if alpha is None:
+            raise AdapterError(f"{module}: alpha_pattern gives {given!r}, not a finite number")
         scale = alpha / math.sqrt(rank) if cfg.get("use_rslora") else alpha / rank
         modules.append(ModuleSpec(layer, kind, rank, alpha, scale, ab["A"], ab["B"]))
     modules.sort(key=lambda m: (m.layer, m.kind))

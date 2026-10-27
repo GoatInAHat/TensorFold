@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import pathlib
+import struct
 
 import pytest
 from adapter_fakes import CFG, SHARED, WO_B, factors, full_config, standard, write_adapter
@@ -60,3 +61,26 @@ def test_what_the_server_would_refuse_is_refused_with_the_reason_and_exit_one(tm
                                                             __import__("numpy").full((CFG.dim, 2), float("nan"),
                                                                                      dtype="float32"))})
     assert run(monkeypatch, capsys, nan, model)[0] == 1
+
+
+@pytest.mark.parametrize("name,manifest,config,match", [
+    ("base", {"format": lf.FORMAT, "base": "deepseek_v41"}, None, "base must be an object"),
+    ("files", {"format": lf.FORMAT, "files": {lf.WEIGHTS: "abc"}}, None,
+     "files.adapter_model.safetensors must be an object"),
+    ("provenance", {"format": lf.FORMAT, "provenance": ["a"]}, None, "provenance must be an object"),
+    ("activated", None, {"alora_invocation_tokens": [5, 6]}, "alora_invocation_tokens is set"),
+])
+def test_a_folder_of_the_wrong_shape_is_refused_with_the_reason_not_a_traceback(tmp_path, model, monkeypatch, capsys,
+                                                                                name, manifest, config, match):
+    folder = standard(tmp_path / name, manifest=manifest, config=config)
+    before = sorted((p.name, p.read_bytes()) for p in folder.iterdir())
+    code, out, err = run(monkeypatch, capsys, folder, model, "--write-manifest")
+    assert code == 1 and out == "" and err.startswith("refused: ") and match in err
+    assert sorted((p.name, p.read_bytes()) for p in folder.iterdir()) == before          # and nothing was written
+
+
+def test_a_weights_header_that_is_not_an_object_is_refused_with_the_reason(tmp_path, model, monkeypatch, capsys):
+    folder = standard(tmp_path / "a")
+    (folder / lf.WEIGHTS).write_bytes(struct.pack("<Q", 2) + b"[]")
+    code, out, err = run(monkeypatch, capsys, folder, model)
+    assert code == 1 and out == "" and err.startswith("refused: ") and "header is not an object" in err
