@@ -46,6 +46,12 @@ class Tables:
     def nbytes(self) -> int:
         return sum(int(t.numel() * t.element_size()) for t in (self.a, self.b, self.ranks, self.scales))
 
+    @staticmethod
+    def required_bytes(slots: int, rank: int, k: int, d: int) -> int:
+        """Bytes for the padded fp32 factors, int32 ranks and fp32 scales, without allocating a tensor."""
+
+        return int(slots) * (padded_rank(rank) * (int(k) + int(d)) + 2) * 4
+
     @classmethod
     def empty(cls, slots: int, rank: int, k: int, d: int, folded: bool, x_dtype: torch.dtype,
               device: str | torch.device = "cuda") -> Tables:

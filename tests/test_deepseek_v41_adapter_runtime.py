@@ -67,6 +67,7 @@ def test_tables_hold_ranks_in_fours_and_the_kernels_tile_is_one_constant():
 
 def test_tables_hold_exactly_what_was_put_and_zero_elsewhere():
     t = Tables.empty(3, 5, 256, 128, False, torch.bfloat16, "cpu")
+    assert Tables.required_bytes(3, 5, 256, 128) == t.nbytes
     assert (t.slots, t.R, t.K, t.D, t.tile_j) == (3, 8, 256, 128, 16) and int(t.ranks.sum()) == 0
     a, b = np.ones((5, 256), np.float32), np.full((128, 5), 2.0, np.float32)
     t.put(2, a, b, 0.5)
@@ -202,9 +203,14 @@ def test_modules_whose_factors_are_all_zero_are_left_out(tmp_path):
     assert sorted(r.layers) == [2] and "1 all-zero modules left out" in logged[0]
 
 
-def test_tables_that_would_not_fit_the_host_are_refused_before_they_are_allocated(registry):
-    with pytest.raises(MemoryError, match="the host has 0.00 GiB"):
-        load(registry, 0, room=lambda: 0.0)
+def test_tables_that_would_not_fit_the_host_are_refused_before_they_are_allocated(registry, monkeypatch):
+    with monkeypatch.context() as patch:
+        def unexpected_allocation(*args, **kwargs):
+            pytest.fail("factor tables allocated before the memory check")
+
+        patch.setattr(Tables, "empty", unexpected_allocation)
+        with pytest.raises(MemoryError, match="the host has 0.00 GiB"):
+            load(registry, 0, room=lambda: 0.0)
     assert load(registry, 0, room=lambda: 64.0).nbytes > 0
     assert load(registry, 0, room=lambda: None).nbytes > 0               # unknown: no check
 

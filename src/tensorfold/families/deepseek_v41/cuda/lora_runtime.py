@@ -147,12 +147,13 @@ class LoraRuntime:
             suh = lay.experts.suh_d[lay.experts.count - 1].float().cpu().numpy() if packed else None
             width, out = dims.shape(kind)
             dtype = torch.float16 if packed else torch.bfloat16
-            tab = Tables.empty(registry.slots, max(f.rank for _, f in loaded), width // world, out, packed, dtype,
-                               device)
+            max_rank = max(f.rank for _, f in loaded)
+            needed = Tables.required_bytes(registry.slots, max_rank, width // world, out)
             free = None if room is None else room()
-            if free is not None and tab.nbytes > free * 2**30:
-                raise MemoryError(f"adapter factors for layer {layer} {kind} need {tab.nbytes / 2**20:.0f} MiB, the "
+            if free is not None and needed > free * 2**30:
+                raise MemoryError(f"adapter factors for layer {layer} {kind} need {needed / 2**20:.0f} MiB, the "
                                   f"host has {free:.2f} GiB to give above its floor")
+            tab = Tables.empty(registry.slots, max_rank, width // world, out, packed, dtype, device)
             for entry, f in loaded:
                 p = place(kind, f, dims, rank, world, entry.strength, suh)
                 tab.put(entry.slot, p.a, p.b, p.scale)
