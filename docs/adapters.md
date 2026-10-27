@@ -106,6 +106,15 @@ made before the warm-up and counted by the allocator ceiling. Start refuses tabl
 - Correctness here means the adapted model is the base weights plus the serialized factors, run as written. It does not
   claim that a checkpoint quantized again from merged weights would give the same activations; compare those separately.
 
+## Checking a running server
+
+Every adapter is a model id, so `python3 tools/bench_concurrent.py URL ADAPTER_ID --alone --serial` checks that an
+adapter's concurrent replies equal their solo runs and drafted equals `"draft": false`, as for any model.
+`python3 tools/dsv41/adapter_mix.py URL --models BASE,adapter-a,adapter-b --streams 4` checks the mixture: the ids rotate
+over the streams, and each stream's token hash must be its own solo run's wherever it sits and whatever runs beside it.
+To check that the flag changes nothing for the base model, compare the base model's hashes from a server with and
+without `--adapter`.
+
 ## Tests
 
 CPU: `tests/test_deepseek_v41_adapter_*.py` (folder validation and refusals, registry and identities, tensor-parallel
